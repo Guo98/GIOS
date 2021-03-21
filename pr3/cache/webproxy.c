@@ -134,28 +134,32 @@ int main(int argc, char **argv) {
   pthread_mutex_t m_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
   pthread_cond_t m_queue_cond = PTHREAD_COND_INITIALIZER;
   message_queue_args *mqa = malloc(sizeof(message_queue_args));
-  mqa->mqueue_mutex = &m_queue_mutex;
-  mqa->mqueue_cond = &m_queue_cond;
+  mqa->mqueue_mutex = m_queue_mutex;
+  mqa->mqueue_cond = m_queue_cond;
+  mqa->server = server;
+  printf("whats in the message queue struct %s\n", mqa->server);
 
-  steque_t m_queue = malloc(sizeof(steque_t));
-  steque_init(&m_queue);
+  steque_t *m_queue = malloc(sizeof(steque_t));
+  steque_init(m_queue);
 
-  mqa->message_queue = &m_queue;
+  mqa->message_queue = m_queue;
   shm_data_struct shm_segments[nsegments];
 
   for(int i = 0; i < nsegments; i++) {
-    shm_segments[i].name = (char *)argv[0];
-    int fd = shm_open(argv[0], O_CREAT, 0666);
+    char shmname[BUFSIZE];
+    snprintf(shmname, BUFSIZE, "/%d", i);
+    shm_segments[i].name = shmname;
+    int fd = shm_open(shmname, O_CREAT, 0666);
     if(fd < 0) {
       fprintf(stderr, "Error, couldn't open file.\n");
       return -1;
     }
-    ftruncate(shm_segments[i].shm_fd, segsize);
+    ftruncate(fd, segsize);
     shm_segments[i].segsize = &segsize;
-    steque_enqueue(&m_queue, &shm_segments[i]);
+    steque_enqueue(m_queue, &shm_segments[i]);
   }
 
-
+  printf("starting server.....\n");
   // Initialize server structure here
   gfserver_init(&gfs, nworkerthreads);
 
@@ -166,11 +170,13 @@ int main(int argc, char **argv) {
 
   // Set up arguments for worker here
   for(i = 0; i < nworkerthreads; i++) {
-    gfserver_setopt(&gfs, GFS_WORKER_ARG, i, &mqa);
+    gfserver_setopt(&gfs, GFS_WORKER_ARG, i, mqa);
   }
   
   // Invoke the framework - this is an infinite loop and shouldn't return
   gfserver_serve(&gfs);
+  free(mqa);
+  steque_destroy(m_queue);
 
   // not reached
   return -1;

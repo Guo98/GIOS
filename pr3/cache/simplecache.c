@@ -55,7 +55,7 @@ int simplecache_init(char *filename){
 		ptr = items[nitems].key;
 		strsep(&ptr, " \t"); 		/* The key is first */
 		path = strsep(&ptr, " \t"); /* The path second */
-
+		
 		if( 0 > (items[nitems].fildes = open(path, O_RDONLY))){
 			fprintf(stderr, "Unable to open file %s.\n", path);
 			exit(CACHE_FAILURE);

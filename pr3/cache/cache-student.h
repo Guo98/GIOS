@@ -12,7 +12,13 @@
 #include <fcntl.h>
 #include <sys/shm.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <pthread.h>
+#include <mqueue.h>
+
+#define MESSAGE_QUEUE_REQUEST "/request_queue"
+#define MESSAGE_QUEUE_RESPONSE "/posix/response"
+#define BUFSIZE (630)
 
 typedef struct shm_data_struct{
     size_t *segsize;
@@ -21,9 +27,22 @@ typedef struct shm_data_struct{
 
 typedef struct message_queue_args {
     steque_t *message_queue;
-    pthread_mutex_t *mqueue_mutex;
-    pthread_cond_t *mqueue_cond;
+    pthread_mutex_t mqueue_mutex;
+    pthread_cond_t mqueue_cond;
+    char *server;
 } message_queue_args;
+
+typedef struct job_args {
+    steque_t *job_queue;
+    pthread_mutex_t job_m;
+    pthread_cond_t job_c;
+} job_args;
+
+typedef struct cache_req_args {
+    char *shm_name;
+    char *request_path;
+    size_t *segsize;
+} cache_req_args;
 
 
 #endif // __CACHE_STUDENT_H__
