@@ -9,18 +9,18 @@ ssize_t handle_with_cache(gfcontext_t *ctx, const char *path, void* arg){
 	snprintf(reqUrl, BUFSIZE, "%s%s", mqa->server, path);
 
 	pthread_mutex_lock(&mqa->mqueue_mutex);
-	while(steque_isempty(mqa->message_queue)) {
+	while(steque_isempty(m_queue)) {
 		pthread_cond_wait(&mqa->mqueue_cond, &mqa->mqueue_mutex);
 	}
 
-	shm_data_struct *sds = (shm_data_struct *)steque_pop(mqa->message_queue);
+	shm_data_struct *sds = steque_pop(m_queue);
 	pthread_mutex_unlock(&mqa->mqueue_mutex);
 
 	mqd_t qd_server;
 
 	struct mq_attr attr;
 	attr.mq_flags = 0;
-	attr.mq_maxmsg = 2;
+	attr.mq_maxmsg = 10;
 	attr.mq_msgsize = BUFSIZE;
 	attr.mq_curmsgs = 0;
 
@@ -34,13 +34,21 @@ ssize_t handle_with_cache(gfcontext_t *ctx, const char *path, void* arg){
 	cra->segsize = sds->segsize;
 	cra->shm_name = sds->name;
 	cra->request_path = reqUrl;
-
-	int mqBytesSent = mq_send(qd_server, (const char *)&cra, sizeof(cra), 0);
-
+	// cache_req_args cra = {
+	// 	.segsize = sds->segsize,
+	// 	.shm_name = sds->name,
+	// 	.request_path = reqUrl
+	// };
+	// (const char *)&cra
+	// int mqBytesSent = mq_send(qd_server, (const char *)cra, BUFSIZE, 0);
+	int mqBytesSent = mq_send(qd_server, (const char *)cra, BUFSIZE, 0);
+	printf("whats in here ------------- %s\n", cra->shm_name);
 	if(mqBytesSent == -1) {
 		fprintf(stderr, "Error, couldn't add request to message queue.\n");
 		return -1;
 	}
+
+	// printf("Message should've been sent %s.\n", sds->name);
 
 	// int fd = shm_open(sds->name, O_RDWR, 0666);
 	// if(fd < 0) {

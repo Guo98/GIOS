@@ -26,7 +26,6 @@ typedef struct shm_data_struct{
 } shm_data_struct;
 
 typedef struct message_queue_args {
-    steque_t *message_queue;
     pthread_mutex_t mqueue_mutex;
     pthread_cond_t mqueue_cond;
     char *server;
@@ -43,6 +42,8 @@ typedef struct cache_req_args {
     char *request_path;
     size_t *segsize;
 } cache_req_args;
+
+extern steque_t *m_queue;
 
 
 #endif // __CACHE_STUDENT_H__

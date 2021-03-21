@@ -50,6 +50,8 @@ static void _sig_handler(int signo){
   }
 }
 
+steque_t *m_queue;
+
 /* Main ========================================================= */
 int main(int argc, char **argv) {
   int i;
@@ -137,26 +139,28 @@ int main(int argc, char **argv) {
   mqa->mqueue_mutex = m_queue_mutex;
   mqa->mqueue_cond = m_queue_cond;
   mqa->server = server;
-  printf("whats in the message queue struct %s\n", mqa->server);
 
-  steque_t *m_queue = malloc(sizeof(steque_t));
+  m_queue = malloc(sizeof(steque_t));
   steque_init(m_queue);
 
-  mqa->message_queue = m_queue;
-  shm_data_struct shm_segments[nsegments];
 
   for(int i = 0; i < nsegments; i++) {
-    char shmname[BUFSIZE];
-    snprintf(shmname, BUFSIZE, "/%d", i);
-    shm_segments[i].name = shmname;
-    int fd = shm_open(shmname, O_CREAT, 0666);
+    shm_data_struct *shm_segment = malloc(sizeof(shm_data_struct));
+    // char shmname[BUFSIZE];
+    shm_segment->name = malloc(BUFSIZE);
+    sprintf(shm_segment->name, "/%d", i);
+    //shm_segment->name = shmname;
+    printf("hopefully correct string is printed ------------ %s\n", shm_segment->name);
+    int fd = shm_open(shm_segment->name , O_CREAT, 0666);
     if(fd < 0) {
       fprintf(stderr, "Error, couldn't open file.\n");
       return -1;
     }
     ftruncate(fd, segsize);
-    shm_segments[i].segsize = &segsize;
-    steque_enqueue(m_queue, &shm_segments[i]);
+    shm_segment->segsize = &segsize;
+    steque_enqueue(m_queue, shm_segment);
+
+    //free(shm_segment);
   }
 
   printf("starting server.....\n");

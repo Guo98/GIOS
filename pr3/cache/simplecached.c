@@ -65,10 +65,10 @@ void *get_requests(void *arg) {
 	while(steque_isempty(req_queue)) {
 		pthread_cond_wait(&cond, &m);
 	}
-	cache_req_args *cra = (cache_req_args *)steque_pop(req_queue);
+	// cache_req_args *cra = (cache_req_args *)steque_pop(req_queue);
 	pthread_mutex_unlock(&m);
 
-	printf("makes it in here-------------- %s\n", cra->request_path);
+	// printf("makes it in here-------------- %s\n", cra->request_path);
 	return 0;
 }
 
@@ -148,26 +148,28 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	qd_server = mq_open(MESSAGE_QUEUE_REQUEST, O_RDONLY, 0644, &attr);
+	qd_server = mq_open(MESSAGE_QUEUE_REQUEST, O_RDONLY | O_CREAT, 0644, &attr);
 	if(qd_server == -1) {
 		fprintf(stderr, "Error, couldn't open message queue.\n");
 		return -1;
 	}
 	while(1) {
-		char buf[BUFSIZE];
+		//char buf[BUFSIZE];
 		cache_req_args *cra = malloc(sizeof(cache_req_args));
-		int mqBytesRecv = mq_receive(qd_server, buf, BUFSIZE, NULL);
+		// cache_req_args cra;
+		int mqBytesRecv = mq_receive(qd_server, (char *)cra, BUFSIZE, NULL);
 		if(mqBytesRecv == -1) {
 			fprintf(stderr, "Error, didn't get message from message queue.\n");
 			return -1;
 		}
-
-		cra = (cache_req_args *)buf;
-
+		printf("whats the request path in here +++++++++++++++ %s\n", cra->request_path);
+		printf("dummy\n");
 		pthread_mutex_lock(&m);
-		steque_enqueue(req_queue, cra);
+		steque_enqueue(req_queue, (cache_req_args *)&cra);
 		pthread_cond_signal(&cond);
 		pthread_mutex_unlock(&m);
+		//cra = (cache_req_args *)buf;
+
 	}
 
 	// Won't execute
