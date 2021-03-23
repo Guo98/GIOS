@@ -1,8 +1,6 @@
 #include "gfserver.h"
 #include "cache-student.h"
 
-#define BUFSIZE (630)
-
 ssize_t handle_with_cache(gfcontext_t *ctx, const char *path, void* arg){
 	message_queue_args *mqa = (message_queue_args *)arg;
 	char reqUrl[BUFSIZE];
@@ -16,12 +14,12 @@ ssize_t handle_with_cache(gfcontext_t *ctx, const char *path, void* arg){
 	shm_data_struct *sds = steque_pop(m_queue);
 	pthread_mutex_unlock(&mqa->mqueue_mutex);
 
-	mqd_t qd_server;
+	mqd_t qd_server, qd_client;
 
 	struct mq_attr attr;
 	attr.mq_flags = 0;
 	attr.mq_maxmsg = 10;
-	attr.mq_msgsize = BUFSIZE;
+	attr.mq_msgsize = MAX_MESSAGE_SIZE;
 	attr.mq_curmsgs = 0;
 
 	qd_server = mq_open(MESSAGE_QUEUE_REQUEST, O_WRONLY | O_CREAT, 0644, &attr);
@@ -31,24 +29,39 @@ ssize_t handle_with_cache(gfcontext_t *ctx, const char *path, void* arg){
 	}
 
 	cache_req_args *cra = malloc(sizeof(cache_req_args));
-	cra->segsize = sds->segsize;
-	cra->shm_name = sds->name;
-	cra->request_path = reqUrl;
-	// cache_req_args cra = {
-	// 	.segsize = sds->segsize,
-	// 	.shm_name = sds->name,
-	// 	.request_path = reqUrl
-	// };
-	// (const char *)&cra
-	// int mqBytesSent = mq_send(qd_server, (const char *)cra, BUFSIZE, 0);
-	int mqBytesSent = mq_send(qd_server, (const char *)cra, BUFSIZE, 0);
-	printf("whats in here ------------- %s\n", cra->shm_name);
+	cra->segsize = (size_t)sds->segsize;
+	strcpy(cra->shm_name, sds->name);
+	strcpy(cra->request_path, path);
+
+	int mqBytesSent = mq_send(qd_server, (const char *)cra, MAX_MESSAGE_SIZE, 0);
 	if(mqBytesSent == -1) {
 		fprintf(stderr, "Error, couldn't add request to message queue.\n");
 		return -1;
 	}
 
-	// printf("Message should've been sent %s.\n", sds->name);
+	printf("Message should've been sent %s.\n", sds->name);
+
+	cache_res_args *cache_res = malloc(sizeof(cache_res_args));
+
+	qd_client = mq_open(MESSAGE_QUEUE_RESPONSE, O_RDONLY | O_CREAT, 0644, &attr);
+	if(qd_client == -1) {
+		fprintf(stderr, "Error, couldn't open repsonse message queue (handle_with_cache).\n");
+		return -1;
+	}
+
+	int mqBytesRecv = mq_receive(qd_client, (char *)cache_res, MAX_MESSAGE_SIZE, 0);
+	if(mqBytesRecv == -1) {
+		fprintf(stderr, "Error, couldn't receive request to response message queue.\n");
+		return -1;
+	}
+
+	printf("whats the file size received ------------ %zu\n", cache_res->size);
+
+	if(cache_res->status == GF_FILE_NOT_FOUND || cache_res->status == GF_ERROR) {
+		return gfs_sendheader(ctx, cache_res->status, cache_res->size);
+	} else {
+		gfs_sendheader(ctx, cache_res->status, cache_res->size);
+	}
 
 	// int fd = shm_open(sds->name, O_RDWR, 0666);
 	// if(fd < 0) {
