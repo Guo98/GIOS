@@ -156,7 +156,7 @@ int main(int argc, char **argv) {
       fprintf(stderr, "Error, couldn't open file.\n");
       return -1;
     }
-    ftruncate(fd, segsize);
+
     shm_segment->segsize = &segsize;
     steque_enqueue(m_queue, shm_segment);
 

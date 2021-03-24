@@ -108,38 +108,52 @@ void *get_requests(void *arg) {
 		fprintf(stderr, "Error, couldn't open response message queue.\n");
 	}
 
+	// cache_res->mutex = sem_open(SEM_MUTEX_NAME, O_CREAT, 0660, 1);
+	// if(cache_res->mutex == SEM_FAILED) {
+	// 	fprintf(stderr, "Error, couldn't create semaphores.\n");
+	// }
+
+	//cache_res->mutex = mutex_sem;
+
+	int read_sem = sem_init(&cache_res->mutex_read, 1, 1);
+	if(read_sem < 0) {
+		fprintf(stderr, "Error, couldn't create read semaphore.\n");
+	}
+	int write_sem = sem_init(&cache_res->mutex_write, 1, 1);
+	if(write_sem < 0) {
+		fprintf(stderr, "Error, couldn't create write semaphore.\n");
+	}
+
 	int mqBytesSent = mq_send(qd_client, (const char *)cache_res, MAX_MESSAGE_SIZE, 0);
 	if(mqBytesSent == -1) {
 		fprintf(stderr, "Error, couldn't add response to message queue.\n");
 	}
 
 	if(cache_res->status == GF_OK && cache_res->size > 0) {
-		printf("will need to use posix ipc\n");
-		size_t bytes_sent = 0;
+		size_t bytes_sent = 0, bytes_read = 0;
 		size_t file_length = cache_res->size;
-		mutex_sem = sem_open(SEM_MUTEX_NAME, O_CREAT, 0660, 1);
-		if(mutex_sem == SEM_FAILED) {
-			fprintf(stderr, "Error, couldn't create semaphores.\n");
-		}
 
 		int shm_fd = shm_open(cra->shm_name, O_RDWR, 0666);
 		if(shm_fd < 0) {
 			fprintf(stderr, "Error, couldn't open the posix ipc segment.\n");
 		}
-		void *ptr = mmap(0, cra->segsize, PROT_WRITE, MAP_SHARED, shm_fd, 0);
+		ftruncate(shm_fd, cra->segsize);
+		void *ptr;
 		while(bytes_sent < file_length) {
-			if(sem_wait(mutex_sem) == -1) {
+			if(sem_wait(&cache_res->mutex_write) == -1) {
 				fprintf(stderr, "Error, couldn't wait on semaphore mutex.\n");
 				exit(1);
 			}
-
-			
-
-			if(sem_post(mutex_sem) == -1) {
+			// start reading and writing
+			ptr = mmap(0, cra->segsize, PROT_WRITE, MAP_SHARED, shm_fd, 0);
+			bytes_read = read(cache_fd, ptr, cra->segsize);
+			bytes_sent += bytes_read;
+			if(sem_post(&cache_res->mutex_read) == -1) {
 				fprintf(stderr, "Error, couldn't unlock semaphore mutex.\n");
 				exit(1);
 			}
 		}
+		// shm_unlink(cra->shm_name);
 	}
 
 

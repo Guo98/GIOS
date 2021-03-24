@@ -49,12 +49,10 @@ typedef struct cache_req_args {
 typedef struct cache_res_args {
     gfstatus_t status;
     size_t size;
+    sem_t mutex_read;
+    sem_t mutex_write;
 } cache_res_args;
 
-typedef struct testReq {
-	char data[BUFSIZE];
-    size_t size;
-} testReq;
 
 extern steque_t *m_queue;
 extern sem_t *mutex_sem;

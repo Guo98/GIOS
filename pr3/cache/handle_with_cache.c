@@ -3,8 +3,7 @@
 
 ssize_t handle_with_cache(gfcontext_t *ctx, const char *path, void* arg){
 	message_queue_args *mqa = (message_queue_args *)arg;
-	char reqUrl[BUFSIZE];
-	snprintf(reqUrl, BUFSIZE, "%s%s", mqa->server, path);
+	size_t bytes_sent = 0;
 
 	pthread_mutex_lock(&mqa->mqueue_mutex);
 	while(steque_isempty(m_queue)) {
@@ -39,8 +38,6 @@ ssize_t handle_with_cache(gfcontext_t *ctx, const char *path, void* arg){
 		return -1;
 	}
 
-	printf("Message should've been sent %s.\n", sds->name);
-
 	cache_res_args *cache_res = malloc(sizeof(cache_res_args));
 
 	qd_client = mq_open(MESSAGE_QUEUE_RESPONSE, O_RDONLY | O_CREAT, 0644, &attr);
@@ -55,33 +52,46 @@ ssize_t handle_with_cache(gfcontext_t *ctx, const char *path, void* arg){
 		return -1;
 	}
 
-	printf("whats the file size received ------------ %zu\n", cache_res->size);
-
 	if(cache_res->status == GF_FILE_NOT_FOUND || cache_res->status == GF_ERROR) {
 		return gfs_sendheader(ctx, cache_res->status, cache_res->size);
 	} else {
 		gfs_sendheader(ctx, cache_res->status, cache_res->size);
+		size_t bytes_recv = 0;
+		int shm_fd = shm_open(sds->name, O_RDWR, 0666);
+		if(shm_fd < 0) {
+			fprintf(stderr, "Error, couldn't open the posix ipc segment.\n");
+			return -1;
+		}
+		void *ptr;
+		while(bytes_sent < cache_res->size) {
+			if(sem_wait(&cache_res->mutex_read) == -1) {
+				fprintf(stderr, "Error, couldn't wait on semaphore mutex.\n");
+				exit(1);
+			}
+			size_t ptr_bytes;
+			if(cache_res->size - bytes_sent > cra->segsize) {
+				ptr_bytes = cra->segsize;
+			} else {
+				ptr_bytes = cache_res->size - bytes_sent;
+			}
+			// start reading and writing
+			ptr = mmap(0, ptr_bytes, PROT_READ, MAP_SHARED, shm_fd, 0);
+			
+			bytes_recv = gfs_send(ctx, ptr, ptr_bytes);
+			if(bytes_recv < 0) {
+				fprintf(stderr, "Error, couldn't send bytes.\n");
+				return -1;
+			}
+			bytes_sent += bytes_recv;
+			if(sem_post(&cache_res->mutex_write) == -1) {
+				fprintf(stderr, "Error, couldn't unlock semaphore mutex.\n");
+				exit(1);
+			}
+		}
+		// shm_unlink(sds->name);
 	}
 
-	// int fd = shm_open(sds->name, O_RDWR, 0666);
-	// if(fd < 0) {
-	// 	fprintf(stderr, "Error, couldn't open IPC for requesting.\n");
-	// 	return -1;
-	// }
-
-	// char *reqBuf = mmap(NULL, (size_t)sds->segsize, PROT_WRITE, MAP_SHARED, fd, 0);
-	// if(reqBuf < 0) {
-	// 	fprintf(stderr, "Error, couldn't map correctly.\n");
-	// 	return -1;
-	// }
-
-	// int messageSizeSent = snprintf(reqBuf, (size_t)sds->segsize, "%s", reqUrl);
-	// if(messageSizeSent < 0) {
-	// 	fprintf(stderr, "Error, couldn't send request url correctly. \n");
-	// 	return -1;
-	// }
-
-	return 0;
+	return bytes_sent;
 
 	// int fildes;
 	// size_t file_len, bytes_transferred;
