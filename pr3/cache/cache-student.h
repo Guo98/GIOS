@@ -24,8 +24,10 @@
 #define MAX_MESSAGE_SIZE 2048
 
 typedef struct shm_data_struct{
-    size_t *segsize;
-    char *name;
+    size_t segsize;
+    char name[BUFSIZE];
+    char read_sem[BUFSIZE];
+    char write_sem[BUFSIZE];
 } shm_data_struct;
 
 typedef struct message_queue_args {
@@ -41,7 +43,7 @@ typedef struct job_args {
 } job_args;
 
 typedef struct cache_req_args {
-    char shm_name[10];
+    char shm_name[100];
     char request_path[BUFSIZE];
     size_t segsize;
 } cache_req_args;
@@ -49,9 +51,16 @@ typedef struct cache_req_args {
 typedef struct cache_res_args {
     gfstatus_t status;
     size_t size;
-    sem_t mutex_read;
-    sem_t mutex_write;
 } cache_res_args;
+
+typedef struct shm_struct_ptr {
+    sem_t wsem;
+    sem_t rsem;
+    gfstatus_t status;
+    size_t size;
+    size_t numofbytes;
+    char data[];
+} shm_struct_ptr;
 
 
 extern steque_t *m_queue;

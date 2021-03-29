@@ -13,7 +13,7 @@ ssize_t handle_with_cache(gfcontext_t *ctx, const char *path, void* arg){
 	shm_data_struct *sds = steque_pop(m_queue);
 	pthread_mutex_unlock(&mqa->mqueue_mutex);
 
-	mqd_t qd_server, qd_client;
+	mqd_t qd_server; 
 
 	struct mq_attr attr;
 	attr.mq_flags = 0;
@@ -28,7 +28,7 @@ ssize_t handle_with_cache(gfcontext_t *ctx, const char *path, void* arg){
 	}
 
 	cache_req_args *cra = malloc(sizeof(cache_req_args));
-	cra->segsize = (size_t)sds->segsize;
+	cra->segsize = sds->segsize;
 	strcpy(cra->shm_name, sds->name);
 	strcpy(cra->request_path, path);
 
@@ -38,105 +38,74 @@ ssize_t handle_with_cache(gfcontext_t *ctx, const char *path, void* arg){
 		return -1;
 	}
 
-	cache_res_args *cache_res = malloc(sizeof(cache_res_args));
 
-	qd_client = mq_open(MESSAGE_QUEUE_RESPONSE, O_RDONLY | O_CREAT, 0644, &attr);
-	if(qd_client == -1) {
-		fprintf(stderr, "Error, couldn't open repsonse message queue (handle_with_cache).\n");
+	int shm_fd = shm_open(sds->name, O_RDWR, 0777);
+	if(shm_fd < 0) {
+		fprintf(stderr, "Error, couldn't open the posix ipc segment.\n");
 		return -1;
 	}
 
-	int mqBytesRecv = mq_receive(qd_client, (char *)cache_res, MAX_MESSAGE_SIZE, 0);
-	if(mqBytesRecv == -1) {
-		fprintf(stderr, "Error, couldn't receive request to response message queue.\n");
-		return -1;
-	}
+	shm_struct_ptr *shm = mmap(NULL, sizeof(struct shm_struct_ptr) + cra->segsize, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
 
-	if(cache_res->status == GF_FILE_NOT_FOUND || cache_res->status == GF_ERROR) {
-		return gfs_sendheader(ctx, cache_res->status, cache_res->size);
+	sem_wait(&shm->rsem);
+	gfstatus_t status = shm->status;
+	size_t file_size = shm->size;
+	sem_post(&shm->wsem);
+
+	if(status == GF_FILE_NOT_FOUND || status == GF_ERROR) {
+		// printf("file was not found in cache %s for %s.\n", path, sds->name);
+		bytes_sent = gfs_sendheader(ctx, status, 0);
 	} else {
-		gfs_sendheader(ctx, cache_res->status, cache_res->size);
 		size_t bytes_recv = 0;
-		int shm_fd = shm_open(sds->name, O_RDWR, 0666);
-		if(shm_fd < 0) {
-			fprintf(stderr, "Error, couldn't open the posix ipc segment.\n");
-			return -1;
-		}
-		void *ptr;
-		while(bytes_sent < cache_res->size) {
-			if(sem_wait(&cache_res->mutex_read) == -1) {
+		gfs_sendheader(ctx, status, file_size);
+
+		int semValue, writeVal;
+		sem_getvalue(&shm->rsem, &semValue);
+		sem_getvalue(&shm->wsem, &writeVal);
+		printf("Total number of bytes to send: %zu for: %s for: %s ::::::::: status:\n", file_size, path, sds->name);
+
+		while(bytes_sent < file_size) {
+			if(sem_wait(&shm->rsem) == -1) {
 				fprintf(stderr, "Error, couldn't wait on semaphore mutex.\n");
-				exit(1);
+				return -1;
 			}
-			size_t ptr_bytes;
-			if(cache_res->size - bytes_sent > cra->segsize) {
-				ptr_bytes = cra->segsize;
-			} else {
-				ptr_bytes = cache_res->size - bytes_sent;
+
+			size_t chunk_bytes = 0;
+			while(chunk_bytes < shm->numofbytes) {
+				// printf("in the while loop here passing numofbytes: %zu for: %s\n", shm->numofbytes, sds->name);
+				bytes_recv = gfs_send(ctx, shm->data, shm->numofbytes);
+				chunk_bytes += bytes_recv;
 			}
-			// start reading and writing
-			ptr = mmap(0, ptr_bytes, PROT_READ, MAP_SHARED, shm_fd, 0);
-			
-			bytes_recv = gfs_send(ctx, ptr, ptr_bytes);
-			if(bytes_recv < 0) {
+			// bytes_recv = gfs_send(ctx, shm->data, shm->numofbytes);
+			if(chunk_bytes < 0) {
 				fprintf(stderr, "Error, couldn't send bytes.\n");
 				return -1;
 			}
-			bytes_sent += bytes_recv;
-			if(sem_post(&cache_res->mutex_write) == -1) {
-				fprintf(stderr, "Error, couldn't unlock semaphore mutex.\n");
-				exit(1);
+			bytes_sent += chunk_bytes;
+			//cprintf("bytes sent: %zu for ::::::::::::::%s ::::::::::::: %d\n", bytes_sent, sds->name, semValue);
+			if(sem_post(&shm->wsem) == -1) {
+				fprintf(stderr, "Error, couldn't post on semaphore mutex.\n");
+				return -1;
 			}
+
 		}
-		// shm_unlink(sds->name);
+		sem_post(&shm->wsem);
+
 	}
+	
+	sem_destroy(&shm->wsem);
+	sem_destroy(&shm->rsem);
 
+	munmap(shm, sizeof(struct shm_struct_ptr) + cra->segsize);
+	// shm_unlink(sds->name);
+	pthread_mutex_lock(&mqa->mqueue_mutex);
+	steque_enqueue(m_queue, sds);
+	pthread_mutex_unlock(&mqa->mqueue_mutex);
+	pthread_cond_signal(&mqa->mqueue_cond);
+
+	free(cra);
+	// free(cache_res);
+	printf("reaches the return statement: %zu for: %s for: %s\n", bytes_sent, sds->name, path);
 	return bytes_sent;
-
-	// int fildes;
-	// size_t file_len, bytes_transferred;
-	// ssize_t read_len, write_len;
-	// char buffer[BUFSIZE];
-	// char *data_dir = arg;
-	// struct stat statbuf;
-
-	// strncpy(buffer,data_dir, BUFSIZE);
-	// strncat(buffer,path, BUFSIZE);
-
-	// if( 0 > (fildes = open(buffer, O_RDONLY))){
-	// 	if (errno == ENOENT)
-	// 		/* If the file just wasn't found, then send FILE_NOT_FOUND code*/ 
-	// 		return gfs_sendheader(ctx, GF_FILE_NOT_FOUND, 0);
-	// 	else
-	// 		/* Otherwise, it must have been a server error. gfserver library will handle*/ 
-	// 		return SERVER_FAILURE;
-	// }
-
-	// /* Calculating the file size */
-	// if (0 > fstat(fildes, &statbuf)) {
-	// 	return SERVER_FAILURE;
-	// }
-
-	// file_len = (size_t) statbuf.st_size;
-
-	// gfs_sendheader(ctx, GF_OK, file_len);
-
-	// /* Sending the file contents chunk by chunk. */
-	// bytes_transferred = 0;
-	// while(bytes_transferred < file_len){
-	// 	read_len = read(fildes, buffer, BUFSIZE);
-	// 	if (read_len <= 0){
-	// 		fprintf(stderr, "handle_with_file read error, %zd, %zu, %zu", read_len, bytes_transferred, file_len );
-	// 		return SERVER_FAILURE;
-	// 	}
-	// 	write_len = gfs_send(ctx, buffer, read_len);
-	// 	if (write_len != read_len){
-	// 		fprintf(stderr, "handle_with_file write error");
-	// 		return SERVER_FAILURE;
-	// 	}
-	// 	bytes_transferred += write_len;
-	// }
-
-	// return bytes_transferred;
 }
 

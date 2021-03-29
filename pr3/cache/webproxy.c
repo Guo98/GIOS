@@ -42,15 +42,26 @@ static struct option gLongOptions[] = {
 extern ssize_t handle_with_cache(gfcontext_t *ctx, char *path, void* arg);
 
 static gfserver_t gfs;
+steque_t *m_queue;
+pthread_mutex_t m_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t m_queue_cond = PTHREAD_COND_INITIALIZER;
 
 static void _sig_handler(int signo){
   if (signo == SIGTERM || signo == SIGINT){
-    gfserver_stop(&gfs);
+    printf("makes it inside the signal handler\n");
+    while(!steque_isempty(m_queue)) {
+      shm_data_struct *sds = steque_pop(m_queue);
+      printf("unlinking this shared memory %s\n", sds->name);
+      shm_unlink(sds->name);
+    }
+    pthread_mutex_destroy(&m_queue_mutex);
+    pthread_cond_destroy(&m_queue_cond);
+    steque_destroy(m_queue);
     exit(signo);
   }
 }
 
-steque_t *m_queue;
+
 
 /* Main ========================================================= */
 int main(int argc, char **argv) {
@@ -133,8 +144,6 @@ int main(int argc, char **argv) {
   }
 
   // Initialize shared memory set-up here
-  pthread_mutex_t m_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
-  pthread_cond_t m_queue_cond = PTHREAD_COND_INITIALIZER;
   message_queue_args *mqa = malloc(sizeof(message_queue_args));
   mqa->mqueue_mutex = m_queue_mutex;
   mqa->mqueue_cond = m_queue_cond;
@@ -142,25 +151,31 @@ int main(int argc, char **argv) {
 
   m_queue = malloc(sizeof(steque_t));
   steque_init(m_queue);
+  shm_data_struct shm_segment[nsegments];
 
 
   for(int i = 0; i < nsegments; i++) {
-    shm_data_struct *shm_segment = malloc(sizeof(shm_data_struct));
-    // char shmname[BUFSIZE];
-    shm_segment->name = malloc(BUFSIZE);
-    sprintf(shm_segment->name, "/%d", i);
-    //shm_segment->name = shmname;
-    printf("hopefully correct string is printed ------------ %s\n", shm_segment->name);
-    int fd = shm_open(shm_segment->name , O_CREAT, 0666);
+    sprintf(shm_segment[i].name, "/%d", i);
+    int fd = shm_open(shm_segment[i].name , O_CREAT | O_RDWR | O_TRUNC, 0777);
     if(fd < 0) {
       fprintf(stderr, "Error, couldn't open file.\n");
       return -1;
     }
+    ftruncate(fd, sizeof(struct shm_struct_ptr) + segsize);
+    shm_struct_ptr *shm =  mmap(NULL, sizeof(struct shm_struct_ptr) + segsize, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+    int read_sem = sem_init(&shm->rsem, 1, 0);
+    if(read_sem < 0) {
+      fprintf(stderr, "Error, couldn't create read semaphore.\n");
+    }
+    int write_sem = sem_init(&shm->wsem, 1, 1);
+    if(write_sem < 0) {
+      fprintf(stderr, "Error, couldn't create write semaphore.\n");
+    }
 
-    shm_segment->segsize = &segsize;
-    steque_enqueue(m_queue, shm_segment);
 
-    //free(shm_segment);
+    munmap(shm, sizeof(struct shm_struct_ptr) + segsize);
+    shm_segment[i].segsize = segsize;
+    steque_enqueue(m_queue, &shm_segment[i]);
   }
 
   printf("starting server.....\n");

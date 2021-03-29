@@ -25,6 +25,11 @@
 static void _sig_handler(int signo){
 	if (signo == SIGTERM || signo == SIGINT){
 		// you should do IPC cleanup here
+		// pthread_cond_destroy(&cond);
+		// pthread_mutex_destroy(&m);
+		// steque_destroy(&req_queue);
+		mq_unlink(MESSAGE_QUEUE_RESPONSE);
+		mq_unlink(MESSAGE_QUEUE_REQUEST);
 		exit(signo);
 	}
 }
@@ -61,102 +66,96 @@ void Usage() {
 
 void *get_requests(void *arg) {
 	//job_args *j_arg = (job_args *)arg;
+	while(1) {
+		pthread_mutex_lock(&m);
+		while(steque_isempty(req_queue)) {
+			pthread_cond_wait(&cond, &m);
+		}
+		cache_req_args *cra = steque_pop(req_queue);
+		pthread_mutex_unlock(&m);
 
-	pthread_mutex_lock(&m);
-	while(steque_isempty(req_queue)) {
-		pthread_cond_wait(&cond, &m);
-	}
-	cache_req_args *cra = steque_pop(req_queue);
-	pthread_mutex_unlock(&m);
+		cache_res_args *cache_res = malloc(sizeof(cache_res_args));
 
-	cache_res_args *cache_res = malloc(sizeof(cache_res_args));
-
-	int cache_fd = simplecache_get(cra->request_path);
-	if(cache_fd < 0) {
-		fprintf(stderr, "Error, couldn't find file in cache.\n");
-		cache_res->status = GF_FILE_NOT_FOUND;
-		cache_res->size = 0;
-	} else {
-		cache_res->status = GF_OK;
-		struct stat fileStat;
-		int fileStatus = fstat(cache_fd, &fileStat);
-		if(fileStatus < 0) {
-			fprintf(stderr, "Error, couldn't get the file status for fd.\n");
+		int cache_fd = simplecache_get(cra->request_path);
+		// printf("fd: %d for path: %s for shm: %s\n", cache_fd, cra->request_path, cra->shm_name);
+		if(cache_fd < 0) {
+			fprintf(stderr, "Error, couldn't find file: %s in cache for %s.\n", cra->request_path, cra->shm_name);
 			cache_res->status = GF_FILE_NOT_FOUND;
 			cache_res->size = 0;
 		} else {
-			off_t fileSize = fileStat.st_size;
-			if(fileSize < 0) {
-				fprintf(stderr, "Error, invalid file length.\n");
+			cache_res->status = GF_OK;
+			struct stat fileStat;
+			int fileStatus = fstat(cache_fd, &fileStat);
+			if(fileStatus < 0) {
+				fprintf(stderr, "Error, couldn't get the file status for fd.\n");
 				cache_res->status = GF_FILE_NOT_FOUND;
 				cache_res->size = 0;
 			} else {
-				cache_res->size = fileSize;
+				off_t fileSize = fileStat.st_size;
+				if(fileSize < 0) {
+					fprintf(stderr, "Error, invalid file length.\n");
+					cache_res->status = GF_FILE_NOT_FOUND;
+					cache_res->size = 0;
+				} else {
+					cache_res->size = fileSize;
+				}
 			}
+
 		}
 
-	}
-
-	mqd_t qd_client;
-	struct mq_attr attr;
-	attr.mq_flags = 0;
-	attr.mq_maxmsg = 10;
-	attr.mq_msgsize = MAX_MESSAGE_SIZE;
-	attr.mq_curmsgs = 0;
-	qd_client = mq_open(MESSAGE_QUEUE_RESPONSE, O_WRONLY | O_CREAT, 0644, &attr);
-	if(qd_client == -1) {
-		fprintf(stderr, "Error, couldn't open response message queue.\n");
-	}
-
-	// cache_res->mutex = sem_open(SEM_MUTEX_NAME, O_CREAT, 0660, 1);
-	// if(cache_res->mutex == SEM_FAILED) {
-	// 	fprintf(stderr, "Error, couldn't create semaphores.\n");
-	// }
-
-	//cache_res->mutex = mutex_sem;
-
-	int read_sem = sem_init(&cache_res->mutex_read, 1, 1);
-	if(read_sem < 0) {
-		fprintf(stderr, "Error, couldn't create read semaphore.\n");
-	}
-	int write_sem = sem_init(&cache_res->mutex_write, 1, 1);
-	if(write_sem < 0) {
-		fprintf(stderr, "Error, couldn't create write semaphore.\n");
-	}
-
-	int mqBytesSent = mq_send(qd_client, (const char *)cache_res, MAX_MESSAGE_SIZE, 0);
-	if(mqBytesSent == -1) {
-		fprintf(stderr, "Error, couldn't add response to message queue.\n");
-	}
-
-	if(cache_res->status == GF_OK && cache_res->size > 0) {
-		size_t bytes_sent = 0, bytes_read = 0;
-		size_t file_length = cache_res->size;
-
-		int shm_fd = shm_open(cra->shm_name, O_RDWR, 0666);
+		int shm_fd = shm_open(cra->shm_name, O_RDWR, 0777);
 		if(shm_fd < 0) {
 			fprintf(stderr, "Error, couldn't open the posix ipc segment.\n");
 		}
-		ftruncate(shm_fd, cra->segsize);
-		void *ptr;
-		while(bytes_sent < file_length) {
-			if(sem_wait(&cache_res->mutex_write) == -1) {
-				fprintf(stderr, "Error, couldn't wait on semaphore mutex.\n");
-				exit(1);
+
+		ftruncate(shm_fd, sizeof(struct shm_struct_ptr) + cra->segsize);
+		shm_struct_ptr *shm =  mmap(NULL, sizeof(struct shm_struct_ptr) + cra->segsize, PROT_WRITE | PROT_READ, MAP_SHARED, shm_fd, 0);
+
+		sem_wait(&shm->wsem);
+		shm->status = cache_res->status;
+		shm->size = cache_res->size;
+		sem_post(&shm->rsem);
+		int readVal, writeVal;
+		sem_getvalue(&shm->rsem, &readVal);
+		sem_getvalue(&shm->wsem, &writeVal);
+
+		printf("whats the semaphores for: %s with path: %s read: %d write: %d\n", cra->shm_name, cra->request_path, readVal, writeVal);
+		if(cache_res->status == GF_OK && cache_res->size > 0) {
+			size_t bytes_sent = 0, bytes_read = 0;
+			size_t file_length = cache_res->size;
+
+			int index = 0;
+			// sem_post(&shm->rsem);
+			while(bytes_sent < file_length) {
+				if(sem_wait(&shm->wsem) == -1) {
+					fprintf(stderr, "Error, couldn't wait on semaphore mutex.\n");
+					exit(1);
+				}
+				size_t write_chunk = 0;
+				if(file_length - bytes_sent > cra->segsize) {
+					write_chunk = cra->segsize;
+				} else {
+					write_chunk = file_length - bytes_sent;
+				}
+				bytes_read = pread(cache_fd, shm->data, write_chunk, index);
+				shm->numofbytes = bytes_read;
+
+				index += bytes_read;
+				bytes_sent += bytes_read;
+				if(sem_post(&shm->rsem) == -1) {
+					fprintf(stderr, "Error, couldn't unlock semaphore mutex.\n");
+					break;
+				}
 			}
-			// start reading and writing
-			ptr = mmap(0, cra->segsize, PROT_WRITE, MAP_SHARED, shm_fd, 0);
-			bytes_read = read(cache_fd, ptr, cra->segsize);
-			bytes_sent += bytes_read;
-			if(sem_post(&cache_res->mutex_read) == -1) {
-				fprintf(stderr, "Error, couldn't unlock semaphore mutex.\n");
-				exit(1);
-			}
+			sem_wait(&shm->wsem);
 		}
+		sem_destroy(&shm->wsem);
+		sem_destroy(&shm->rsem);
+		munmap(shm, sizeof(struct shm_struct_ptr) + cra->segsize);
 		// shm_unlink(cra->shm_name);
+		free(cache_res);
+		free(cra);
 	}
-
-
 	return 0;
 }
 
@@ -246,15 +245,23 @@ int main(int argc, char **argv) {
 		int mqBytesRecv = mq_receive(qd_server, (char *)cra, MAX_MESSAGE_SIZE, NULL);
 		if(mqBytesRecv == -1) {
 			fprintf(stderr, "Error, didn't get message from message queue.\n");
-			return -1;
 		}
 
 		pthread_mutex_lock(&m);
 		steque_enqueue(req_queue, (cache_req_args *)cra);
-		pthread_cond_signal(&cond);
 		pthread_mutex_unlock(&m);
+		pthread_cond_signal(&cond);
 	}
 
+	for(int i = 0; i < nthreads; i++) {
+		if(pthread_join(tid[i], NULL) < 0) {
+			fprintf(stderr, "Error, couldn't join worker thread %d\n", i);
+			exit(1);
+		}
+	}
+	simplecache_destroy();
+	steque_destroy(req_queue);
+	free(req_queue);
 	// Won't execute
 	return 0;
 }
