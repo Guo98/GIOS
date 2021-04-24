@@ -17,6 +17,7 @@
 #include <sys/inotify.h>
 #include <grpcpp/grpcpp.h>
 #include <utime.h>
+#include <google/protobuf/util/time_util.h>
 
 #include "src/dfs-utils.h"
 #include "src/dfslibx-clientnode-p2.h"
@@ -31,8 +32,24 @@ using grpc::ClientWriter;
 using grpc::ClientReader;
 using grpc::ClientContext;
 
+using namespace std;
+
+using dfs_service::FileInfo;
+using dfs_service::Result;
+using dfs_service::FileRequest;
+using dfs_service::FileName;
+using dfs_service::FileContent;
+using dfs_service::Empty;
+using dfs_service::FilesList;
+using dfs_service::FileStat;
+using dfs_service::FileStatus;
+
+using google::protobuf::util::TimeUtil;
+using google::protobuf::Timestamp;
 
 extern dfs_log_level_e DFS_LOG_LEVEL;
+
+int BUFSIZE = 1024;
 
 //
 // STUDENT INSTRUCTION:
@@ -41,8 +58,8 @@ extern dfs_log_level_e DFS_LOG_LEVEL;
 // message types you are using to indicate
 // a file request and a listing of files from the server.
 //
-using FileRequestType = FileRequest;
-using FileListResponseType = FileList;
+using FileRequestType = FileInfo;
+using FileListResponseType = dfs_service::FilesList;
 
 DFSClientNodeP2::DFSClientNodeP2() : DFSClientNode() {}
 DFSClientNodeP2::~DFSClientNodeP2() {}
@@ -67,6 +84,26 @@ grpc::StatusCode DFSClientNodeP2::RequestWriteAccess(const std::string &filename
     //
     //
 
+    ClientContext ctx;
+    ctx.AddMetadata("file_name", filename);
+    chrono::time_point<chrono::system_clock> deadline = chrono::system_clock::now() + chrono::milliseconds(deadline_timeout);
+    ctx.set_deadline(deadline);
+    FileInfo file_req;
+    Result res;
+
+    ctx.AddMetadata("client_id", ClientId());
+
+    file_req.set_name(filename);
+
+    Status lock_status = service_stub->GetWriteLock(&ctx, file_req, &res);
+
+    if(lock_status.ok()) {
+        return StatusCode::OK;
+    } else {
+        return lock_status.error_code();
+    }
+
+    return StatusCode::CANCELLED;
 }
 
 grpc::StatusCode DFSClientNodeP2::Store(const std::string &filename) {
@@ -95,7 +132,74 @@ grpc::StatusCode DFSClientNodeP2::Store(const std::string &filename) {
     // StatusCode::CANCELLED otherwise
     //
     //
+    ClientContext ctx;
+    FileName file_resp;
+    ctx.AddMetadata("file_name", filename);
+    chrono::time_point<chrono::system_clock> deadline = chrono::system_clock::now() + chrono::milliseconds(deadline_timeout);
+    ctx.set_deadline(deadline);
 
+    ctx.AddMetadata("client_id", ClientId());
+
+    const string& filepath = WrapPath(filename);
+
+    struct stat file_stats;
+    int filestatval = stat(filepath.c_str(), &file_stats);
+    if(filestatval != 0) {
+        dfs_log(LL_ERROR) << "File path: " << filepath << " was not found.";
+        return StatusCode::NOT_FOUND;
+    }
+
+    int file_size = file_stats.st_size;
+    StatusCode writelock_status = this->RequestWriteAccess(filename);
+
+    if(writelock_status == StatusCode::OK) {
+        unique_ptr<ClientWriter<FileContent>> file_data_stream = service_stub->StoreFile(&ctx, &file_resp);
+
+        // read file
+        ifstream fd(filepath);
+        int bytes_sent = 0;
+        char buf[BUFSIZE];
+        FileContent file_content;
+
+
+        try {
+            file_content.set_size(dfs_file_checksum(filepath, &this->crc_table));
+            while(bytes_sent < file_size) {
+                memset(buf, 0, sizeof buf);
+                int bytes_to_send = 0;
+                if(BUFSIZE < file_size - bytes_sent) {
+                    bytes_to_send = BUFSIZE;
+                } else {
+                    bytes_to_send = file_size - bytes_sent;
+                }
+
+                fd.read(buf, bytes_to_send);
+                file_content.set_data(buf, bytes_to_send);
+                file_data_stream->Write(file_content);
+
+                bytes_sent += bytes_to_send;
+            }
+
+            fd.close();
+        } catch (exception& e) {
+            dfs_log(LL_ERROR) << "Error in storing file (client)): " << e.what();
+            return StatusCode::CANCELLED;
+        }
+
+        file_data_stream->WritesDone();
+        Status store_status = file_data_stream->Finish();
+
+        if(store_status.ok()) {
+            return StatusCode::OK;
+        } else {
+            return store_status.error_code();
+        }
+    } else {
+        return writelock_status;
+    }
+    
+
+    return StatusCode::CANCELLED;
 }
 
 
@@ -122,6 +226,59 @@ grpc::StatusCode DFSClientNodeP2::Fetch(const std::string &filename) {
     //
     // Hint: You may want to match the mtime on local files to the server's mtime
     //
+    ClientContext ctx;
+    chrono::time_point<chrono::system_clock> deadline = chrono::system_clock::now() + chrono::milliseconds(deadline_timeout);
+    ctx.set_deadline(deadline);
+
+    ctx.AddMetadata("client_id", ClientId());
+
+    FileRequest file_req;
+    file_req.set_filename(filename);
+
+    const string& file_path = WrapPath(filename);
+
+    file_req.set_checksum(dfs_file_checksum(file_path, &this->crc_table));
+
+    dfs_log(LL_SYSINFO) << "client checksum: " << dfs_file_checksum(file_path, &this->crc_table);
+
+    StatusCode writelock_status = this->RequestWriteAccess(filename);
+
+    if(writelock_status == StatusCode::OK) {
+        unique_ptr<ClientReader<FileContent>> file_resp = service_stub->FetchFile(&ctx, file_req);
+
+        FileContent file_content;
+        ofstream fd;
+
+        try {
+            dfs_log(LL_SYSINFO) << "fetch file: " << filename;
+            // fd.open(file_path);
+            while(file_resp->Read(&file_content)) {
+                if(!fd.is_open()) {
+                    fd.open(file_path);
+                }
+                fd << file_content.data();
+                // dfs_log(LL_SYSINFO) << "fetch file: " << filename;
+            }
+            dfs_log(LL_SYSINFO) << "finished while loop";
+            fd.close();
+        } catch (exception& e) {
+            dfs_log(LL_ERROR) << "Error in getting file: " << file_path;
+            return StatusCode::CANCELLED;
+        }
+
+        Status fetch_status = file_resp->Finish();
+        if(fetch_status.ok()) {
+            return StatusCode::OK;
+        } else {
+            dfs_log(LL_SYSINFO) << "In the else error code";
+            return fetch_status.error_code();
+        }
+    } else {
+        return writelock_status;
+    }
+
+    
+    return StatusCode::CANCELLED;
 }
 
 grpc::StatusCode DFSClientNodeP2::Delete(const std::string &filename) {
@@ -145,7 +302,26 @@ grpc::StatusCode DFSClientNodeP2::Delete(const std::string &filename) {
     // StatusCode::CANCELLED otherwise
     //
     //
+    ClientContext ctx;
+    chrono::time_point<chrono::system_clock> deadline = chrono::system_clock::now() + chrono::milliseconds(deadline_timeout);
+    ctx.set_deadline(deadline);
 
+    ctx.AddMetadata("client_id", ClientId());
+
+    FileRequest file_req;
+    file_req.set_filename(filename);
+
+    Empty file_resp;
+
+    Status delete_status = service_stub->DeleteFile(&ctx, file_req, &file_resp);
+
+    if(delete_status.ok()) {
+        return StatusCode::OK;
+    } else {
+        return delete_status.error_code();
+    }
+
+    return StatusCode::CANCELLED;
 }
 
 grpc::StatusCode DFSClientNodeP2::List(std::map<std::string,int>* file_map, bool display) {
@@ -166,6 +342,24 @@ grpc::StatusCode DFSClientNodeP2::List(std::map<std::string,int>* file_map, bool
     // StatusCode::CANCELLED otherwise
     //
     //
+    ClientContext ctx;
+    chrono::time_point<chrono::system_clock> deadline = chrono::system_clock::now() + chrono::milliseconds(deadline_timeout);
+    ctx.set_deadline(deadline);
+
+    Empty file_req;
+    FilesList list_resp;
+
+    Status list_status = service_stub->ListFiles(&ctx, file_req, &list_resp);
+
+    if(list_status.ok()) {
+        for(const FileStatus& fstat : list_resp.file()) {
+            file_map->insert(pair<string, int>(fstat.filename(), TimeUtil::TimestampToSeconds(fstat.modified())));
+            dfs_log(LL_SYSINFO) << "File: " << fstat.filename();
+        }
+        return StatusCode::OK;
+    } else {
+        return list_status.error_code();
+    }
 }
 
 grpc::StatusCode DFSClientNodeP2::Stat(const std::string &filename, void* file_status) {
@@ -187,7 +381,26 @@ grpc::StatusCode DFSClientNodeP2::Stat(const std::string &filename, void* file_s
     // StatusCode::CANCELLED otherwise
     //
     //
-}
+    ClientContext ctx;
+    chrono::time_point<chrono::system_clock> deadline = chrono::system_clock::now() + chrono::milliseconds(deadline_timeout);
+    ctx.set_deadline(deadline);
+
+    FileRequest request;
+    request.set_filename(filename);
+
+    FileStatus response;
+
+    Status stat_status = service_stub->GetFileStatus(&ctx, request, &response);
+
+    if(stat_status.ok()) {
+        dfs_log(LL_SYSINFO) << "File: " << response.filename() << " created: " << response.created();
+        return StatusCode::OK;
+    } else {
+        return stat_status.error_code();
+    }
+
+    return stat_status.error_code();
+} 
 
 void DFSClientNodeP2::InotifyWatcherCallback(std::function<void()> callback) {
 
@@ -210,9 +423,9 @@ void DFSClientNodeP2::InotifyWatcherCallback(std::function<void()> callback) {
     // the async thread when a file event has been signaled?
     //
 
-
+    callback_lock.lock();
     callback();
-
+    callback_lock.unlock();
 }
 
 //
@@ -255,7 +468,6 @@ void DFSClientNodeP2::HandleCallbackList() {
             //
             // Consider adding a critical section or RAII style lock here
             //
-
             // The tag is the memory location of the call_data object
             AsyncClientData<FileListResponseType> *call_data = static_cast<AsyncClientData<FileListResponseType> *>(tag);
 
@@ -283,7 +495,42 @@ void DFSClientNodeP2::HandleCallbackList() {
                 // Do nothing?
                 //
 
+                callback_lock.lock();
+                for(const FileStatus& server_file : call_data->reply.file()) {
+                    FileStatus client_file;
+                    struct stat file_stat;
+                    const string& file_path = WrapPath(server_file.filename());
+                    int filestatval = stat(file_path.c_str(), &file_stat);
+                    if(filestatval != 0) {
+                        dfs_log(LL_SYSINFO) << "Couldn't get file stats for file: " << file_path;
+                        StatusCode fetch_status = this->Fetch(server_file.filename());
+                        if(fetch_status != StatusCode::OK) {
+                            //dfs_log(LL_ERROR) << "Couldn't fetch file: " << server_file.filename();
+                        } else {
+                            dfs_log(LL_SYSINFO) << "file doesn't exist, fetching worked";;
+                        }
+                    } else {
+                        Timestamp* modified = new Timestamp(TimeUtil::TimeTToTimestamp(file_stat.st_mtime));
+                        client_file.set_allocated_modified(modified);;
+                        if(server_file.modified() > client_file.modified()) {
+                            StatusCode update_status = this->Fetch(server_file.filename());
+                            if(update_status != StatusCode::OK) {
+                               //  dfs_log(LL_ERROR) << "Couldn't fetch to update file: " << server_file.filename();
+                            } else {
+                                dfs_log(LL_SYSINFO) << "was successful in fetching";
+                            }
+                        } else if(server_file.modified() < client_file.modified()) {
+                            StatusCode store_status = this->Store(server_file.filename());
+                            if(store_status != StatusCode::OK) {
+                               //  dfs_log(LL_ERROR) << "Couldn't store file on server, file: " << server_file.filename();
+                            } else {
+                                dfs_log(LL_SYSINFO) << "was successful in storing";
+                            }
+                        }
+                    }
+                }
 
+                callback_lock.unlock();
 
             } else {
                 dfs_log(LL_ERROR) << "Status was not ok. Will try again in " << DFS_RESET_TIMEOUT << " milliseconds.";

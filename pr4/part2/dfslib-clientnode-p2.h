@@ -13,10 +13,12 @@
 #include "src/dfslibx-clientnode-p2.h"
 #include "proto-src/dfs-service.grpc.pb.h"
 
+using namespace std;
+
 class DFSClientNodeP2 : public DFSClientNode {
 
 public:
-
+    mutable mutex callback_lock;
     //
     // STUDENT INSTRUCTION:
     //

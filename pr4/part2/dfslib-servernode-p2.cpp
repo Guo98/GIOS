@@ -12,6 +12,8 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <grpcpp/grpcpp.h>
+#include <google/protobuf/util/time_util.h>
+#include <shared_mutex>
 
 #include "proto-src/dfs-service.grpc.pb.h"
 #include "src/dfslibx-call-data.h"
@@ -29,6 +31,23 @@ using grpc::ServerBuilder;
 
 using dfs_service::DFSService;
 
+using namespace std;
+
+using dfs_service::FileInfo;
+using dfs_service::Result;
+using dfs_service::DFSService;
+using dfs_service::FileName;
+using dfs_service::FileRequest;
+using dfs_service::FileContent;
+using dfs_service::Empty;
+using dfs_service::FilesList;
+using dfs_service::FileStat;
+using dfs_service::FileStatus;
+
+using google::protobuf::util::TimeUtil;
+using google::protobuf::Timestamp;
+
+int BUFSIZE_SERVER = 1024;
 
 //
 // STUDENT INSTRUCTION:
@@ -37,8 +56,8 @@ using dfs_service::DFSService;
 // message types you are using in your `dfs-service.proto` file
 // to indicate a file request and a listing of files from the server
 //
-using FileRequestType = FileRequest;
-using FileListResponseType = FileList;
+using FileRequestType = FileInfo;
+using FileListResponseType = FilesList;
 
 extern dfs_log_level_e DFS_LOG_LEVEL;
 
@@ -97,6 +116,37 @@ private:
 
     /** CRC Table kept in memory for faster calculations **/
     CRC::Table<std::uint32_t, 32> crc_table;
+
+    // write mutex
+    shared_timed_mutex writeLock;
+    shared_timed_mutex directory_lock;
+    map<string, string> filenameMap;
+    map<string, unique_ptr<shared_timed_mutex>> writelockMap;
+
+    void EraseClientId(string file_name) {
+        writeLock.lock();
+        dfs_log(LL_SYSINFO) << "Erasing filename from client id map.";
+        filenameMap.erase(file_name);
+        writeLock.unlock();
+    }
+
+    bool DoesLockExist(string file_name, string client_id) {
+        if(filenameMap.find(file_name) == filenameMap.end()) {
+            dfs_log(LL_SYSINFO) << "doesn't find the file";
+            filenameMap.insert({ file_name, client_id });
+            if(writelockMap.find(file_name) == writelockMap.end()) {
+                writelockMap.insert({ file_name, make_unique<shared_timed_mutex>() });
+            }
+            return true;
+        } else if((filenameMap.find(file_name)->second).compare(client_id) != 0) {
+            dfs_log(LL_SYSINFO) << "different client has the lock";
+            return false;
+        } else if ((filenameMap.find(file_name)->second).compare(client_id) == 0) {
+            dfs_log(LL_SYSINFO) << "correct client has the lock";
+            return true;
+        }
+        return false;
+    }
 
 public:
 
@@ -168,6 +218,13 @@ public:
         // is aware of. The client will then need to make the appropriate calls based on those changes.
         //
 
+        Status list_status = this->CallbackList(context, request, response);
+        if(!list_status.ok()) {
+            dfs_log(LL_ERROR) << "Errored out listing files";
+        } else {
+            dfs_log(LL_SYSINFO) << "Successfully got the list of files";
+        }
+
     }
 
     /**
@@ -217,7 +274,411 @@ public:
     // the implementations of your rpc protocol methods.
     //
 
+    Status GetWriteLock(ServerContext* context, const FileInfo* file_req, Result* res) override {
+        const multimap<grpc::string_ref, grpc::string_ref>& file_metadata = context->client_metadata();
+        auto client_id_check = file_metadata.find("client_id");
 
+        if(client_id_check != file_metadata.end()) {
+            string client_id((client_id_check->second).data(), (client_id_check->second).length());
+            dfs_log(LL_SYSINFO) << "Client id: " << client_id;
+
+            writeLock.lock();
+            
+            auto clientidFromMap = filenameMap.find(file_req->name());
+            dfs_log(LL_SYSINFO) << "Successfully locks to look for locks";
+            if(clientidFromMap != filenameMap.end()) {
+                string strClientId = clientidFromMap->second;
+                if(strClientId.compare(client_id) != 0) {
+                    writeLock.unlock();
+                    stringstream no_lock_err;
+                    no_lock_err << "File already has a different write lock on it.";
+                    dfs_log(LL_SYSINFO) << "file already has a different write lock on it";
+                    return Status(StatusCode::RESOURCE_EXHAUSTED, no_lock_err.str());
+                } else {
+                    writeLock.unlock();
+                    dfs_log(LL_SYSINFO) << "client already has the file lock";
+                    return Status::OK;
+                }
+            }
+
+            dfs_log(LL_SYSINFO) << "Doesn't meet any of the conditionals";
+            filenameMap.insert({ file_req->name(), client_id });
+            if(writelockMap.find(file_req->name()) == writelockMap.end()) {
+                dfs_log(LL_SYSINFO) << "Adding a lock for file";
+                writelockMap.insert({ file_req->name(), make_unique<shared_timed_mutex>() });
+            }
+            writeLock.unlock();
+            dfs_log(LL_SYSINFO) << "client got the lock";
+            return Status::OK;
+        } else {
+            stringstream file_name_err;
+            file_name_err << "Couldn't get file name." << endl;
+            dfs_log(LL_ERROR) << file_name_err.str();
+            return Status(StatusCode::CANCELLED, file_name_err.str());
+        }
+
+        stringstream eof_err;
+        eof_err << "Error with function" << endl;
+        return Status(StatusCode::CANCELLED, eof_err.str());
+    }
+
+    Status StoreFile(ServerContext* context, ServerReader<FileContent>* file_request, FileName* response) override {
+        const multimap<grpc::string_ref, grpc::string_ref>& file_metadata = context->client_metadata();
+        auto file_name_check = file_metadata.find("file_name");
+        auto client_id_check = file_metadata.find("client_id");
+
+        if(file_name_check != file_metadata.end()) {
+            string file_name((file_name_check->second).data(), (file_name_check->second).length());
+            dfs_log(LL_SYSINFO) << "File name: " << file_name;
+
+            const string& file_path = WrapPath(file_name);
+            if(client_id_check != file_metadata.end()) {
+                string client_id((client_id_check->second).data(), (client_id_check->second).length());
+                // case where no lock or other client was found for the clientid
+                writeLock.lock_shared();
+                dfs_log(LL_SYSINFO) << "Checking if lock exists";
+                if(!DoesLockExist(file_name, client_id)) {
+                    dfs_log(LL_ERROR) << "No lock found";
+                    stringstream no_lock_err;
+                    no_lock_err << "No lock was found for file: " << file_name << endl;
+                    writeLock.unlock_shared();
+                    return Status(StatusCode::RESOURCE_EXHAUSTED, no_lock_err.str());
+                }
+                writeLock.unlock_shared();
+
+                uint32_t server_file_checksum = dfs_file_checksum(file_path, &this->crc_table);
+
+                shared_timed_mutex* file_write_lock = writelockMap.find(file_name)->second.get();
+                directory_lock.lock();
+                file_write_lock->lock();
+                FileContent file_content;
+                ofstream fd;
+                // fd.open(file_path);
+
+                try {
+                    while(file_request->Read(&file_content)) {
+                        if(context->IsCancelled()) {
+                            fd.close();
+                            directory_lock.unlock();
+                            file_write_lock->unlock();
+                            EraseClientId(file_name);
+                            stringstream deadline_err; 
+                            deadline_err << "Past the deadline time." << endl;
+                            dfs_log(LL_ERROR) << deadline_err.str();
+                            return Status(StatusCode::DEADLINE_EXCEEDED, deadline_err.str());
+                        }
+                        if(server_file_checksum == file_content.size()) {
+                            fd.close();
+                            directory_lock.unlock();
+                            file_write_lock->unlock();
+                            EraseClientId(file_name);
+                            stringstream checksum_err; 
+                            checksum_err << "Checksum was the same as the file in the server." << endl;
+                            dfs_log(LL_ERROR) << checksum_err.str();
+                            return Status(StatusCode::ALREADY_EXISTS, checksum_err.str());
+                        }
+                        if(!fd.is_open()) {
+                            fd.open(file_path);
+                        }
+                        fd << file_content.data();
+                    }
+                    EraseClientId(file_name);
+                    fd.close();
+                } catch (exception& e) {
+                    stringstream exception_err;
+                    exception_err << e.what() << endl;
+                    EraseClientId(file_name);
+                    fd.close();
+                    directory_lock.unlock();
+                    file_write_lock->unlock();
+                    dfs_log(LL_ERROR) << "Store file expection: " << exception_err.str();
+                    return Status(StatusCode::CANCELLED, exception_err.str());
+                }
+
+                struct stat file_stats;
+                int filestatval = stat(file_path.c_str(), &file_stats);
+                if(filestatval != 0) {
+                    stringstream not_found_err;
+                    not_found_err << "File path: " << file_path << " was not found." << endl;
+                    dfs_log(LL_ERROR) << not_found_err.str();
+                    EraseClientId(file_name);
+                    directory_lock.unlock();
+                    file_write_lock->unlock();
+                    return Status(StatusCode::NOT_FOUND, not_found_err.str());
+                }
+                directory_lock.unlock();
+                file_write_lock->unlock();
+
+                response->set_filename(file_name);
+                return Status::OK;
+
+            }
+        } else {
+            stringstream file_name_err;
+            file_name_err << "Couldn't get file name." << endl;
+            dfs_log(LL_ERROR) << file_name_err.str();
+            return Status(StatusCode::CANCELLED, file_name_err.str());
+        }
+
+        stringstream eof_err;
+        eof_err << "Reached the end of the function without doing anything error." << endl;
+        dfs_log(LL_ERROR) << eof_err.str();
+        return Status(StatusCode::CANCELLED, eof_err.str());
+    }
+
+    Status FetchFile(ServerContext* context, const FileRequest* request, ServerWriter<FileContent>* response) override {
+        const multimap<grpc::string_ref, grpc::string_ref>& file_metadata = context->client_metadata();
+        auto client_id_check = file_metadata.find("client_id");
+
+        if(client_id_check != file_metadata.end()) {
+            const string& file_path = WrapPath(request->filename());
+            string client_id((client_id_check->second).data(), (client_id_check->second).length());
+            // case where no lock or other client was found for the clientid
+            writeLock.lock_shared();
+            dfs_log(LL_SYSINFO) << "Checking if lock exists";
+            if(!DoesLockExist(request->filename(), client_id)) {
+                dfs_log(LL_ERROR) << "No lock found";
+                stringstream no_lock_err;
+                no_lock_err << "No lock was found for file: " << request->filename() << endl;
+                writeLock.unlock_shared();
+                return Status(StatusCode::CANCELLED, no_lock_err.str());
+            }
+            writeLock.unlock_shared();
+
+            uint32_t server_file_checksum = dfs_file_checksum(file_path, &this->crc_table);
+
+            dfs_log(LL_SYSINFO) << "server checksum: " << server_file_checksum;
+            if(server_file_checksum == request->checksum()) {
+                EraseClientId(request->filename());
+                stringstream checksum_err; 
+                checksum_err << "Checksum was the same as the file in the server for file: " << request->filename();
+                dfs_log(LL_ERROR) << checksum_err.str();
+                return Status(StatusCode::ALREADY_EXISTS, checksum_err.str());
+            }
+
+            shared_timed_mutex* file_write_lock = writelockMap.find(request->filename())->second.get();
+
+            directory_lock.lock();
+            file_write_lock->lock();
+
+            struct stat file_stats;
+            int filestatval = stat(file_path.c_str(), &file_stats);
+            if(filestatval != 0) {
+                EraseClientId(request->filename());
+                directory_lock.unlock();
+                file_write_lock->unlock();
+                stringstream not_found_err;
+                not_found_err << "File path: " << file_path << " was not found." << endl;
+                dfs_log(LL_ERROR) << not_found_err.str();
+                return Status(StatusCode::NOT_FOUND, not_found_err.str());
+            }
+
+            int file_size = file_stats.st_size;
+            FileContent file_content;
+            ifstream fd(file_path);
+            char buf[BUFSIZE_SERVER];
+            int bytes_sent = 0;
+
+            try {
+                while(bytes_sent < file_size) {
+                    if(context->IsCancelled()) {
+                        EraseClientId(request->filename());
+                        directory_lock.unlock();
+                        file_write_lock->unlock();
+                        stringstream deadline_err; 
+                        deadline_err << "Past the deadline time." << endl;
+                        dfs_log(LL_ERROR) << deadline_err.str();
+                        return Status(StatusCode::DEADLINE_EXCEEDED, deadline_err.str());
+                    }
+                    memset(buf, 0, sizeof buf);
+                    int bytes_to_send = 0;
+                    if(BUFSIZE_SERVER < file_size - bytes_sent) {
+                        bytes_to_send = BUFSIZE_SERVER;
+                    } else {
+                        bytes_to_send = file_size - bytes_sent;
+                    }
+
+                    fd.read(buf, bytes_to_send);
+                    file_content.set_size(bytes_to_send);
+                    file_content.set_data(buf, bytes_to_send);
+                    response->Write(file_content);
+
+                    bytes_sent += bytes_to_send;
+                    // dfs_log(LL_SYSINFO) << "Bytes sent: " << bytes_sent;
+                }
+                EraseClientId(request->filename());
+                directory_lock.unlock();
+                file_write_lock->unlock();
+                fd.close();
+            } catch (exception& e) {
+                EraseClientId(request->filename());
+                directory_lock.unlock();
+                file_write_lock->unlock();
+                stringstream file_err;
+                file_err << "Couldn't send the file." << endl;
+                dfs_log(LL_ERROR) << file_err.str();
+                return Status(StatusCode::CANCELLED, file_err.str());
+            }
+
+            return Status::OK;
+        } else {
+            stringstream client_id_err;
+            client_id_err << "Couldn't get client id." << endl;
+            dfs_log(LL_ERROR) << client_id_err.str();
+            return Status(StatusCode::CANCELLED, client_id_err.str());
+        }
+        stringstream eof_err;
+        eof_err << "Reached the end of the function without doing anything error." << endl;
+        dfs_log(LL_ERROR) << eof_err.str();
+        return Status(StatusCode::CANCELLED, eof_err.str());
+    }
+
+    Status DeleteFile(ServerContext* context, const FileRequest* request, Empty* response) override {
+        const multimap<grpc::string_ref, grpc::string_ref>& file_metadata = context->client_metadata();
+        auto client_id_check = file_metadata.find("client_id");
+
+        if(client_id_check != file_metadata.end()) {
+            const string& file_path = WrapPath(request->filename());
+            string client_id((client_id_check->second).data(), (client_id_check->second).length());
+            // case where no lock or other client was found for the clientid
+            writeLock.lock_shared();
+            dfs_log(LL_SYSINFO) << "Checking if lock exists";
+            if(!DoesLockExist(request->filename(), client_id)) {
+                dfs_log(LL_ERROR) << "No lock found";
+                stringstream no_lock_err;
+                no_lock_err << "No lock was found for file: " << request->filename() << endl;
+                writeLock.unlock_shared();
+                return Status(StatusCode::CANCELLED, no_lock_err.str());
+            }
+            writeLock.unlock_shared();
+            shared_timed_mutex* file_write_lock = writelockMap.find(request->filename())->second.get();
+
+            file_write_lock->lock();
+            directory_lock.lock();
+
+            struct stat file_stats;
+            int filestatval = stat(file_path.c_str(), &file_stats);
+            if(filestatval != 0) {
+                EraseClientId(request->filename());
+                directory_lock.unlock();
+                file_write_lock->unlock();
+                stringstream not_found_err;
+                not_found_err << "File path: " << file_path << " was not found." << endl;
+                dfs_log(LL_ERROR) << not_found_err.str();
+                return Status(StatusCode::NOT_FOUND, not_found_err.str());
+            }
+
+            if(context->IsCancelled()) {
+                EraseClientId(request->filename());
+                directory_lock.unlock();
+                file_write_lock->unlock();
+                stringstream deadline_err; 
+                deadline_err << "Past the deadline time." << endl;
+                dfs_log(LL_ERROR) << deadline_err.str();
+                return Status(StatusCode::DEADLINE_EXCEEDED, deadline_err.str());
+            }
+
+            if(remove(file_path.c_str()) != 0) {
+                EraseClientId(request->filename());
+                directory_lock.unlock();
+                file_write_lock->unlock();
+                stringstream delete_err;
+                delete_err << "Error in deleting file: " << file_path << endl;
+                dfs_log(LL_ERROR) << delete_err.str();
+                return Status(StatusCode::CANCELLED, delete_err.str());
+            }
+            EraseClientId(request->filename());
+            directory_lock.unlock();
+            file_write_lock->unlock();
+            return Status::OK;
+        } else {
+            stringstream client_id_err;
+            client_id_err << "Couldn't get client id." << endl;
+            dfs_log(LL_ERROR) << client_id_err.str();
+            return Status(StatusCode::CANCELLED, client_id_err.str());
+        }
+        stringstream eof_err;
+        eof_err << "Reached the end of the function without doing anything error." << endl;
+        dfs_log(LL_ERROR) << eof_err.str();
+        return Status(StatusCode::CANCELLED, eof_err.str());
+    }
+
+    Status ListFiles(ServerContext* context, const Empty* request, FilesList* response) override {
+        DIR *directory;
+        struct dirent *ent;
+        directory_lock.lock_shared();
+
+        directory = opendir(mount_path.c_str());
+        if(directory != NULL) {
+            while((ent = readdir(directory)) != NULL) {
+                const string& file_path = WrapPath(ent->d_name);
+
+                struct stat file_stats;
+                int filestatval = stat(file_path.c_str(), &file_stats);
+                if(filestatval != 0) {
+                    stringstream not_found_err;
+                    not_found_err << "File path: " << file_path << " was not found." << endl;
+                    dfs_log(LL_ERROR) << not_found_err.str();
+                    directory_lock.unlock();
+                    return Status(StatusCode::NOT_FOUND, not_found_err.str());
+                }
+
+                if(!(file_stats.st_mode & S_IFREG)) {
+                    dfs_log(LL_SYSINFO) << "not a file.";
+                    continue;
+                }
+
+                FileStatus* fs = response->add_file();
+                fs->set_filename(ent->d_name);
+                Timestamp* modified = new Timestamp(TimeUtil::TimeTToTimestamp(file_stats.st_mtime));
+                fs->set_allocated_modified(modified);
+
+                Timestamp* created = new Timestamp(TimeUtil::TimeTToTimestamp(file_stats.st_ctime));
+                fs->set_allocated_created(created);
+
+                int file_size = file_stats.st_size;
+                fs->set_size(file_size);
+            }
+            closedir(directory);
+        } else {
+            closedir(directory);
+            directory_lock.unlock_shared();
+        }
+
+        directory_lock.unlock_shared();
+        return Status::OK;
+    }
+
+    Status GetFileStatus(ServerContext* context, const FileRequest* request, FileStatus* response) override {
+        const string& file_path = WrapPath(request->filename());
+
+        response->set_filename(request->filename());
+
+        struct stat file_stats;
+        int filestatval = stat(file_path.c_str(), &file_stats);
+        if(filestatval != 0) {
+            stringstream not_found_err;
+            not_found_err << "File path: " << file_path << " was not found." << endl;
+            dfs_log(LL_ERROR) << not_found_err.str();
+            return Status(StatusCode::NOT_FOUND, not_found_err.str());
+        }
+
+        int file_size = file_stats.st_size;
+        response->set_size(file_size);
+
+        Timestamp* modified = new Timestamp(TimeUtil::TimeTToTimestamp(file_stats.st_mtime));
+        Timestamp* created = new Timestamp(TimeUtil::TimeTToTimestamp(file_stats.st_ctime));
+
+        response->set_allocated_modified(modified);
+        response->set_allocated_created(created);
+
+        return Status::OK;
+    }
+
+    Status CallbackList(ServerContext* context, const FileInfo* file_req, FilesList* response) override {
+        Empty request;
+        return this->ListFiles(context, &request, response);
+    }
 };
 
 //
